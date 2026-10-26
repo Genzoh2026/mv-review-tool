@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MV Review Tool</title>
+<style>
+  :root { --bg:#14151a; --panel:#1e2028; --line:#33363f; --text:#e8e8ec; --dim:#9a9ca6; --accent:#ff4d6d; --ok:#4dd6a0; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 "Yu Gothic UI", "Segoe UI", sans-serif; }
+  header { display:flex; gap:12px; align-items:center; padding:8px 16px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0 8px 0 0; }
+  main { display:grid; grid-template-columns: minmax(0,1fr) 360px; gap:16px; padding:16px; }
+  @media (max-width: 1000px) { main { grid-template-columns: 1fr; } }
+  .stage { position:relative; background:#000; aspect-ratio:16/9; width:100%; }
+  .stage video, .stage canvas { position:absolute; inset:0; width:100%; height:100%; }
+  .stage canvas { cursor:crosshair; }
+  .bar { display:flex; gap:8px; align-items:center; margin-top:8px; flex-wrap:wrap; }
+  button, select, input[type=file]::file-selector-button { background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:6px; padding:5px 10px; cursor:pointer; font:inherit; }
+  button:hover { border-color:var(--dim); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .time { font-variant-numeric: tabular-nums; min-width: 190px; }
+  .cut { color:var(--dim); margin-top:4px; min-height:1.5em; }
+  .timeline { position:relative; height:28px; margin-top:8px; background:var(--panel); border:1px solid var(--line); border-radius:6px; cursor:pointer; }
+  .timeline .head { position:absolute; top:0; bottom:0; width:2px; background:var(--text); pointer-events:none; }
+  .timeline .tick { position:absolute; top:2px; bottom:2px; width:4px; margin-left:-2px; background:var(--accent); border-radius:2px; }
+  .timeline .cutline { position:absolute; top:0; bottom:0; width:1px; background:var(--line); }
+  aside { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; max-height: calc(100vh - 90px); overflow:auto; }
+  aside h2 { font-size:14px; margin:0 0 8px; }
+  .item { border:1px solid var(--line); border-radius:6px; padding:8px; margin-bottom:8px; }
+  .item.active { border-color:var(--accent); }
+  .item .meta { color:var(--dim); font-size:12px; display:flex; justify-content:space-between; gap:8px; }
+  .item .num { display:inline-block; min-width:20px; text-align:center; background:var(--accent); color:#fff; border-radius:10px; padding:0 6px; margin-right:6px; font-size:12px; }
+  .item textarea { width:100%; margin-top:6px; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:4px; padding:6px; font:inherit; resize:vertical; min-height:54px; }
+  .item .acts { display:flex; gap:6px; margin-top:6px; }
+  .hint { color:var(--dim); font-size:12px; margin-top:8px; }
+  .toast { color:var(--ok); }
+</style>
+</head>
+<body>
+<header>
+  <h1>MV 修正指示ツール</h1>
+  <label>動画 <input type="file" id="file" accept="video/*"></label>
+  <label>カット表CSV(任意) <input type="file" id="csv" accept=".csv,text/csv"></label>
+  <label>FPS <input type="number" id="fps" value="24" min="1" max="120" step="any" style="width:64px"></label>
+  <span id="srcname" style="color:var(--dim)"></span>
+</header>
+<main>
+  <section>
+    <div class="stage">
+      <video id="v" preload="auto" controlslist="nodownload"></video>
+      <canvas id="c"></canvas>
+    </div>
+    <div class="timeline" id="tl"><div class="head" id="head"></div></div>
+    <div class="bar">
+      <button id="play">再生 / 一時停止 (Space)</button>
+      <button id="back1">◀ 1コマ (←)</button>
+      <button id="fwd1">1コマ ▶ (→)</button>
+      <button id="back1s">-1秒 (Shift+←)</button>
+      <button id="fwd1s">+1秒 (Shift+→)</button>
+      <select id="rate"><option value="0.25">0.25x</option><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="1.5">1.5x</option></select>
+      <span class="time" id="time">0:00.000</span>
+    </div>
+    <div class="cut" id="cut"></div>
+    <div class="hint">動画上をクリック → その時刻・位置にマークを追加（自動で一時停止）。右のコメント欄に修正内容を書いてください。位置を指さない指示は「全体コメントを追加」を使います（その時刻だけが記録されます）。</div>
+  </section>
+  <aside>
+    <h2>指示 <span id="count">(0)</span></h2>
+    <div class="bar" style="margin-top:0;margin-bottom:8px">
+      <button id="addGeneral">全体コメントを追加</button>
+      <button id="copyMd" class="primary">Markdown をコピー</button>
+      <button id="dlJson">JSON 保存</button>
+      <button id="dlMd">MD 保存</button>
+      <button id="clear">全削除</button>
+    </div>
+    <div id="msg" class="toast"></div>
+    <div id="list"></div>
+  </aside>
+</main>
+<script>
+"use strict";
+let CUTS = [];           // {no, start, end, section, label, note}; loaded from an optional CSV
+let FPS = 24;
+const STORE_PREFIX = "mv-review-v1:";
+let storeKey = STORE_PREFIX;  // notes are stored per video file name
+
+const $ = (id) => document.getElementById(id);
+const v = $("v"), cv = $("c"), ctx = cv.getContext("2d");
+let notes = [];          // {id, t, x, y, text}  x,y: 0..1, or null for a whole-scene note
+let activeId = null;
+
+function load() {
+  try { notes = JSON.parse(localStorage.getItem(storeKey)) || []; } catch { notes = []; }
+}
+function save() {
+  try { localStorage.setItem(storeKey, JSON.stringify(notes)); } catch { /* storage may be blocked */ }
+}
+function fmt(t) {
+  const m = Math.floor(t / 60), s = t - m * 60;
+  return `${m}:${s.toFixed(3).padStart(6, "0")}`;
+}
+function cutAt(t) {
+  return CUTS.find((c) => t >= c.start && t < c.end) || CUTS[CUTS.length - 1] || null;
+}
+function cutLabel(c) {
+  return c ? `カット${c.no} [${c.section}] ${c.label}${c.note ? " — " + c.note : ""}` : "";
+}
+function frameOf(t) { return Math.round(t * FPS); }
+
+function resizeCanvas() {
+  const r = cv.getBoundingClientRect();
+  cv.width = r.width * devicePixelRatio; cv.height = r.height * devicePixelRatio;
+  draw();
+}
+function draw() {
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  const t = v.currentTime;
+  for (const n of notes) {
+    if (n.x === null || Math.abs(n.t - t) > 0.5) continue;
+    const x = n.x * cv.width, y = n.y * cv.height, r = 14 * devicePixelRatio;
+    ctx.lineWidth = 3 * devicePixelRatio;
+    ctx.strokeStyle = n.id === activeId ? "#ffd166" : "#ff4d6d";
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = ctx.strokeStyle;
+    ctx.font = `bold ${13 * devicePixelRatio}px sans-serif`;
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(String(notes.indexOf(n) + 1), x, y);
+  }
+}
+
+function renderTimeline() {
+  const tl = $("tl");
+  tl.querySelectorAll(".tick,.cutline").forEach((e) => e.remove());
+  const d = v.duration || 1;
+  for (const c of CUTS) {
+    const l = document.createElement("div");
+    l.className = "cutline"; l.style.left = (c.start / d * 100) + "%"; tl.appendChild(l);
+  }
+  notes.forEach((n, i) => {
+    const k = document.createElement("div");
+    k.className = "tick"; k.style.left = (n.t / d * 100) + "%"; k.title = `${i + 1}: ${n.text.slice(0, 30)}`;
+    tl.appendChild(k);
+  });
+}
+
+function renderList() {
+  const list = $("list");
+  list.textContent = "";
+  $("count").textContent = `(${notes.length})`;
+  notes.forEach((n, i) => {
+    const el = document.createElement("div");
+    el.className = "item" + (n.id === activeId ? " active" : "");
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const left = document.createElement("span");
+    const num = document.createElement("span"); num.className = "num"; num.textContent = i + 1;
+    left.append(num, `${fmt(n.t)} (f${frameOf(n.t)})`);
+    const right = document.createElement("span");
+    const c = cutAt(n.t);
+    right.textContent = c ? `カット${c.no}` : "";
+    meta.append(left, right);
+    const ta = document.createElement("textarea");
+    ta.value = n.text; ta.placeholder = "どう直したいか（例：口元を隠す／色を明るく／この拍で切る）";
+    ta.addEventListener("input", () => { n.text = ta.value; save(); renderTimeline(); });
+    ta.addEventListener("focus", () => { activeId = n.id; draw(); });
+    const acts = document.createElement("div"); acts.className = "acts";
+    const go = document.createElement("button"); go.textContent = "ここへ移動";
+    go.addEventListener("click", () => { v.pause(); v.currentTime = n.t; activeId = n.id; draw(); });
+    const del = document.createElement("button"); del.textContent = "削除";
+    del.addEventListener("click", () => { notes = notes.filter((x) => x.id !== n.id); save(); refresh(); });
+    acts.append(go, del);
+    el.append(meta, ta, acts);
+    list.appendChild(el);
+  });
+}
+function refresh() { renderList(); renderTimeline(); draw(); }
+
+function addNote(x, y) {
+  const n = { id: Date.now() + Math.random(), t: v.currentTime, x, y, text: "" };
+  notes.push(n);
+  notes.sort((a, b) => a.t - b.t);
+  activeId = n.id;
+  save(); refresh();
+  const ta = $("list").querySelectorAll("textarea")[notes.indexOf(n)];
+  if (ta) { ta.focus(); ta.scrollIntoView({ block: "nearest" }); }
+}
+
+function toMarkdown() {
+  const lines = ["# MV 修正指示", "", `動画: ${$("srcname").textContent}`, `件数: ${notes.length}`, ""];
+  notes.forEach((n, i) => {
+    const c = cutAt(n.t);
+    const pos = n.x === null ? "指定なし" : `画面内 x=${(n.x * 100).toFixed(0)}% y=${(n.y * 100).toFixed(0)}%`;
+    lines.push(`## ${i + 1}. ${fmt(n.t)}（フレーム ${frameOf(n.t)}）`);
+    lines.push(`- カット: ${c ? cutLabel(c) : "-"}`);
+    lines.push(`- 位置: ${pos}`);
+    lines.push(`- 指示: ${n.text.trim() || "（未記入）"}`, "");
+  });
+  return lines.join("\n");
+}
+function toJson() {
+  return JSON.stringify({
+    video: $("srcname").textContent, fps: FPS,
+    notes: notes.map((n, i) => ({
+      no: i + 1, time_s: +n.t.toFixed(3), frame: frameOf(n.t),
+      cut: cutAt(n.t)?.no ?? null, cut_label: cutAt(n.t)?.label ?? null,
+      x: n.x, y: n.y, text: n.text,
+    })),
+  }, null, 2);
+}
+function download(name, text, type) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type }));
+  a.download = name; a.click(); URL.revokeObjectURL(a.href);
+}
+function toast(s) { $("msg").textContent = s; setTimeout(() => { $("msg").textContent = ""; }, 2500); }
+
+function seek(dt) { v.currentTime = Math.max(0, Math.min(v.duration || 0, v.currentTime + dt)); }
+function setSrc(url, name) {
+  v.src = url; $("srcname").textContent = name;
+  storeKey = STORE_PREFIX + name;
+  activeId = null; load(); refresh();
+}
+
+// Cut list CSV columns: no, start_s, end_s, section, label, lyric_or_note (header row required)
+function parseCsv(text) {
+  const rows = [];
+  let row = [], cell = "", quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quoted) {
+      if (ch === '"' && text[i + 1] === '"') { cell += '"'; i++; }
+      else if (ch === '"') quoted = false;
+      else cell += ch;
+    } else if (ch === '"') quoted = true;
+    else if (ch === ",") { row.push(cell); cell = ""; }
+    else if (ch === "\n" || ch === "\r") {
+      if (ch === "\r" && text[i + 1] === "\n") i++;
+      row.push(cell); cell = ""; rows.push(row); row = [];
+    } else cell += ch;
+  }
+  if (cell || row.length) { row.push(cell); rows.push(row); }
+  return rows.filter((r) => r.some((c) => c.trim() !== ""));
+}
+function loadCuts(text) {
+  const [head, ...body] = parseCsv(text.replace(/^\uFEFF/, ""));
+  if (!head) throw new Error("CSV が空です");
+  const col = (name) => head.indexOf(name);
+  const idx = ["no", "start_s", "end_s"].map(col);
+  if (idx.some((i) => i < 0)) throw new Error("CSV に no, start_s, end_s 列が必要です");
+  const [section, label, note] = ["section", "label", "lyric_or_note"].map(col);
+  const cell = (r, i) => (i < 0 ? "" : (r[i] || ""));
+  CUTS = body.map((r) => ({
+    no: Number(r[idx[0]]), start: Number(r[idx[1]]), end: Number(r[idx[2]]),
+    section: cell(r, section), label: cell(r, label), note: cell(r, note),
+  }));
+}
+
+cv.addEventListener("click", (e) => {
+  const r = cv.getBoundingClientRect();
+  v.pause();
+  addNote((e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height);
+});
+$("file").addEventListener("change", (e) => {
+  const f = e.target.files[0];
+  if (f) setSrc(URL.createObjectURL(f), f.name);
+});
+$("csv").addEventListener("change", async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  try { loadCuts(await f.text()); toast(`カット ${CUTS.length} 件を読み込みました`); refresh(); }
+  catch (err) { CUTS = []; toast(`読み込めません: ${err.message}`); }
+});
+$("fps").addEventListener("change", (e) => { FPS = +e.target.value > 0 ? +e.target.value : 24; });
+$("play").addEventListener("click", () => (v.paused ? v.play() : v.pause()));
+$("back1").addEventListener("click", () => { v.pause(); seek(-1 / FPS); });
+$("fwd1").addEventListener("click", () => { v.pause(); seek(1 / FPS); });
+$("back1s").addEventListener("click", () => seek(-1));
+$("fwd1s").addEventListener("click", () => seek(1));
+$("rate").addEventListener("change", (e) => { v.playbackRate = +e.target.value; });
+$("tl").addEventListener("click", (e) => {
+  const r = $("tl").getBoundingClientRect();
+  v.currentTime = (e.clientX - r.left) / r.width * (v.duration || 0);
+});
+$("addGeneral").addEventListener("click", () => { v.pause(); addNote(null, null); });
+$("copyMd").addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText(toMarkdown()); toast("コピーしました"); }
+  catch { download("mv_review.md", toMarkdown(), "text/markdown"); toast("コピーできないため保存しました"); }
+});
+$("dlJson").addEventListener("click", () => download("mv_review.json", toJson(), "application/json"));
+$("dlMd").addEventListener("click", () => download("mv_review.md", toMarkdown(), "text/markdown"));
+$("clear").addEventListener("click", () => {
+  if (notes.length && confirm("すべての指示を削除します。よろしいですか？")) { notes = []; save(); refresh(); }
+});
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "TEXTAREA") return;
+  if (e.code === "Space") { e.preventDefault(); v.paused ? v.play() : v.pause(); }
+  else if (e.code === "ArrowLeft") { e.preventDefault(); v.pause(); seek(e.shiftKey ? -1 : -1 / FPS); }
+  else if (e.code === "ArrowRight") { e.preventDefault(); v.pause(); seek(e.shiftKey ? 1 : 1 / FPS); }
+});
+function tick() {
+  const t = v.currentTime;
+  $("time").textContent = `${fmt(t)} / ${fmt(v.duration || 0)}  f${frameOf(t)}`;
+  $("cut").textContent = cutLabel(cutAt(t));
+  $("head").style.left = (t / (v.duration || 1) * 100) + "%";
+  draw();
+  requestAnimationFrame(tick);
+}
+v.addEventListener("loadedmetadata", renderTimeline);
+window.addEventListener("resize", resizeCanvas);
+
+load();
+resizeCanvas(); refresh(); tick();
+</script>
+</body>
+</html>
